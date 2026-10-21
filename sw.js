@@ -1,5 +1,5 @@
 // Cache dell'app per l'uso offline. Cambiare VERSIONE a ogni rilascio: l'app propone l'aggiornamento.
-const VERSIONE = 'spesa-1.0.0';
+const VERSIONE = 'spesa-1.1.0';
 const FILE = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
   'js/app.js', 'js/db.js', 'js/logic.js', 'js/io.js', 'js/parser.js', 'js/off.js', 'js/store.js', 'js/fmt.js', 'js/date.js', 'js/scanner.js',

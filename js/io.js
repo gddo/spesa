@@ -1,5 +1,5 @@
 // Import/export: CSV, zip dell'app del Mac, export per l'analisi, backup SQLite.
-import { TABELLE_DATI, PREZZO_INIZIALE, init } from './db.js';
+import { TABELLE_DATI, PREZZO_INIZIALE, init, convertiStati } from './db.js';
 
 const fflate = () => globalThis.fflate;
 
@@ -35,7 +35,7 @@ export function toCsv(righe, colonne) {
 }
 
 // ---------------------------------------------------------------- import dallo zip dell'app del Mac
-const ORDINE_IMPORT = ['prodotti', 'scontrini', 'righe', 'alias', 'pesate', 'prezzi_kg', 'stato_gruppi'];
+const ORDINE_IMPORT = ['prodotti', 'scontrini', 'righe', 'alias', 'pesate', 'prezzi_kg', 'stato_gruppi', 'conte'];
 
 export function leggiZipMac(bytes) {
   const file = fflate().unzipSync(bytes);
@@ -77,6 +77,7 @@ export function importaZipMac(db, tabelle) {
         if (!('g_settimana' in g)) continue;
         db.run('UPDATE gruppi SET g_settimana=? WHERE id=?', [nulli(g.g_settimana), g.id]);
       }
+      convertiStati(db);
       const rotti = db.all('PRAGMA foreign_key_check');
       if (rotti.length) throw new Error(`dati incoerenti nello zip (${rotti.length} riferimenti rotti, es. ${rotti[0].table})`);
       return conteggi;
@@ -89,7 +90,7 @@ export function importaZipMac(db, tabelle) {
 // ---------------------------------------------------------------- export per l'analisi (stesso formato dell'app Python)
 export function zipExport(db) {
   const file = {};
-  for (const t of ['gruppi', 'scontrini', 'righe', 'prodotti', 'alias', 'pesate', 'prezzi_kg', 'stato_gruppi', 'v_righe']) {
+  for (const t of ['gruppi', 'scontrini', 'righe', 'prodotti', 'alias', 'pesate', 'prezzi_kg', 'conte', 'v_righe']) {
     const cols = db.all(`PRAGMA table_info(${t})`).map(c => c.name);
     file[`${t}.csv`] = fflate().strToU8(toCsv(db.all(`SELECT * FROM ${t}`), cols));
   }

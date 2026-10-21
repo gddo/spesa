@@ -1,6 +1,6 @@
 // Spesa & piano — PWA. Tutti i dati restano sul telefono (SQLite in IndexedDB).
 import { esc, euro, g as fg, n1, intero, num, attr, opzioni } from './fmt.js';
-import { Db, init, PREPARAZIONI, salvaProdotto, aggiungiPrezzo, aggiornaProdotto, prodottoInUso, PREZZO_INIZIALE } from './db.js';
+import { Db, init, PREPARAZIONI, RUOLI, salvaProdotto, aggiungiPrezzo, aggiornaProdotto, prodottoInUso, PREZZO_INIZIALE } from './db.js';
 import * as L from './logic.js';
 import * as IO from './io.js';
 import * as store from './store.js';
@@ -9,7 +9,7 @@ import { parsePdf } from './parser.js';
 import * as scanner from './scanner.js';
 import { oggi, adesso, dataBreve, diffGiorni } from './date.js';
 
-const VERSIONE = '1.0.0';
+const VERSIONE = '1.1.0';
 const S = { SQL: null, db: null, esitiImport: null, ultimaRotta: '' };
 const app = document.getElementById('app');
 const enc = encodeURIComponent;
@@ -82,12 +82,35 @@ async function render() {
 
 const gruppiOpzioni = () => S.db.all('SELECT id, nome FROM gruppi ORDER BY ordine').map(x => [x.id, x.nome]);
 const prepOpzioni = () => PREPARAZIONI.map(x => [x, x]);
-const stato = s => (s === 'finito' ? 'finito' : s === 'presente' ? "ce n'è" : 'auto');
 
 // ---------------------------------------------------------------- componenti
-function seg(gid, attuale) {
-  return `<div class="seg">${['finito', 'presente', 'auto'].map(v =>
-    `<button type="button" data-act="stato" data-gid="${esc(gid)}" data-stato="${v}" class="${(attuale || 'auto') === v ? 'on' : ''}">${stato(v)}</button>`).join('')}</div>`;
+const porzTesto = (n, nome) => `${n1(n)} ${n === 1 ? (nome === 'frutti' ? 'frutto' : nome === 'porzioni' ? 'porzione' : nome) : nome}`;
+
+/** Contatore della dispensa: − / numero modificabile / + (una porzione alla volta). */
+function contatore(d) {
+  return `<div class="conta" data-gid="${esc(d.id)}">
+    <button type="button" data-act="conta" data-delta="-1" aria-label="una porzione in meno">−</button>
+    <input value="${n1(d.mostra)}" inputmode="decimal" data-change="conta-set" aria-label="porzioni in casa">
+    <button type="button" data-act="conta" data-delta="1" aria-label="una porzione in più">+</button>
+  </div>`;
+}
+
+const giorniFa = iso => {
+  if (!iso) return 'mai';
+  const n = diffGiorni(oggi(), iso);
+  return n <= 0 ? 'oggi' : n === 1 ? 'ieri' : `${n} giorni fa`;
+};
+
+const dec = v => n1(Math.round(v * 10) / 10);
+function motivoBreve(s) {
+  const r = s.ritardo;
+  return `${r >= 0.5 ? `indietro di ${dec(r)}` : r <= -0.5 ? `avanti di ${dec(-r)}` : 'in pari'} · mangiato: ${giorniFa(s.ultimoConsumo)}`;
+}
+
+function motivo(s) {
+  const r = s.ritardo;
+  const stato = r >= 0.5 ? `in ritardo di ${n1(Math.round(r * 10) / 10)} porzioni` : r <= -0.5 ? `in anticipo di ${n1(Math.round(-r * 10) / 10)} porzioni` : 'in pari';
+  return `${stato} sul piano (ultime 4 settimane) · ultimo consumo ${giorniFa(s.ultimoConsumo)}`;
 }
 
 function campiPrezzo(prezzi, conElimina = true) {
@@ -129,45 +152,66 @@ const DOPO = {};
 
 VISTE.lista = () => {
   const db = S.db;
-  const giorni = Math.max(1, parseInt(db.kvGet('lista_giorni', '4'), 10) || 4);
-  const fuori = Math.max(0, parseInt(db.kvGet('lista_fuori', '0'), 10) || 0);
-  const l = L.cosaComprare(db, oggi(), giorni, fuori);
+  const pasti = Math.max(0, parseInt(db.kvGet('lista_pasti', '4'), 10) || 0);
+  const l = L.lista(db, oggi(), pasti);
   let sp = JSON.parse(db.kvGet('spunte', '{}'));
   if (sp.data !== oggi()) sp = { data: oggi(), ids: [] };
   const fatto = id => sp.ids.includes(id);
+  const maiContati = db.kvGet('dispensa_ok') ? [] : l.dispensa.filter(d => !d.ultimaConta).map(d => d.gruppo);
 
-  const voce = (r, daComprare) => {
-    const quanto = r.famiglia
-      ? r.opzioni.map(o => `<b>${fg(o.g)}</b> ${esc(o.gruppo.toLowerCase())}`).join('<span class="mut"> oppure </span>')
-      : `<b>${n1(r.porzioni)} ${esc(r.porzione_nome || '')}</b> <span class="mut">(${fg(r.manca)})</span>`;
-    const stati = r.famiglia
-      ? r.membri.map(m => `<div class="membro"><span>${esc(m.gruppo)}</span>${seg(m.id, m.stato)}</div>`).join('')
-      : seg(r.id, r.stato);
-    return `<div class="item${daComprare && fatto(r.id) ? ' fatto' : ''}">
-      ${daComprare ? `<button type="button" class="tick" data-act="spunta" data-id="${esc(r.id)}" aria-label="preso">${fatto(r.id) ? '✓' : ''}</button>` : ''}
-      <div class="corpo">
-        <div class="titolo">${esc(r.gruppo)}</div>
-        <div class="qta">${daComprare ? quanto : `fabbisogno ${fg(r.fabbisogno)}${r.famiglia ? ' equivalenti' : ''}`}</div>
-        <div class="mut">scorta stimata ${fg(r.scorta)}${r.note.length ? ' · ' + esc(r.note.join('; ')) : ''}</div>
-        ${stati}
-      </div></div>`;
-  };
-  const presi = l.compra.filter(r => fatto(r.id)).length;
-  return `<h1>Cosa comprare</h1>
+  const voceCompra = (id, titolo, quanto, nota) => `<div class="item${fatto(id) ? ' fatto' : ''}">
+      <button type="button" class="tick" data-act="spunta" data-id="${esc(id)}" aria-label="preso">${fatto(id) ? '✓' : ''}</button>
+      <div class="corpo"><div class="titolo">${esc(titolo)}</div><div class="qta">${quanto}</div>${nota ? `<div class="mut">${nota}</div>` : ''}</div></div>`;
+  const compra = [
+    ...l.compraSecondi.map(x => voceCompra(`sec:${x.id}`, x.gruppo,
+      `<b>${porzTesto(x.daComprare, x.porzione_nome)}</b> <span class="mut">(${fg(x.daComprare * x.porzione_g)})</span>`, esc(motivo(x)))),
+    ...l.compraPasto.map(x => voceCompra(x.id, x.gruppo, x.opzioni
+      ? x.opzioni.filter(o => o.porzioni).map(o => `<b>${porzTesto(o.porzioni, 'porzioni')}</b> ${esc(o.gruppo.toLowerCase())} <span class="mut">(${fg(o.g)})</span>`).join('<span class="mut"> oppure </span>')
+      : `<b>${porzTesto(x.porzioni, x.porzione_nome)}</b> <span class="mut">(${fg(x.g)})</span>`,
+      `per ${l.pasti} pasti servono ${fg(x.serve)}, in casa ${fg(x.stock_g)}`)),
+  ];
+  const presi = [...l.compraSecondi.map(x => `sec:${x.id}`), ...l.compraPasto.map(x => x.id)].filter(fatto).length;
+  const nCompra = l.compraSecondi.length + l.compraPasto.length;
+
+  // prossimi pasti: sequenza raggruppata per gruppo, nell'ordine della prima volta
+  const perGruppo = new Map();
+  l.sequenza.forEach((x, i) => {
+    if (!perGruppo.has(x.id)) perGruppo.set(x.id, { ...x, pasti: [] });
+    perGruppo.get(x.id).pasti.push({ n: i + 1, inCasa: x.inCasa });
+  });
+  const secondo = Object.fromEntries(l.secondi.map(x => [x.id, x]));
+  const dispRiga = d => `<div class="disp">
+      <div class="corpo"><div class="titolo">${esc(d.gruppo)}</div>
+        <div class="mut">da ${fg(d.porzione_g)}${secondo[d.id] ? ` · ${esc(motivoBreve(secondo[d.id]))}` : ''}</div></div>
+      ${contatore(d)}</div>`;
+
+  return `<h1>Cosa mangio e cosa compro</h1>
     <div class="card">
-      <div class="row2">
-        <label>Giorni fino alla prossima spesa<input name="giorni" inputmode="numeric" value="${giorni}" data-change="lista-param"></label>
-        <label>Pranzi/cene fuori<input name="fuori" inputmode="numeric" value="${fuori}" data-change="lista-param"></label>
-      </div>
-      <div class="mut">Prima di uscire segna <b>finito</b> (va in lista) o <b>ce n'è</b> (non va in lista); <b>auto</b> = stima dagli scontrini. Il segno decade al primo scontrino importato con quel gruppo.</div>
+      <div class="riga-input"><span>Pasti principali da coprire<br><span class="mut">pranzi o cene a casa fino alla prossima spesa</span></span>
+        <div class="conta"><button type="button" data-act="pasti" data-delta="-1">−</button><input value="${pasti}" inputmode="numeric" data-change="pasti-set"><button type="button" data-act="pasti" data-delta="1">+</button></div></div>
     </div>
-    <h2>Da comprare <span class="mut">${presi}/${l.compra.length} presi</span></h2>
-    <div class="lista">${l.compra.length ? l.compra.map(r => voce(r, true)).join('') : '<div class="card">Niente: la scorta stimata copre il periodo.</div>'}</div>
+    ${maiContati.length ? `<div class="card warn"><b>Prima volta: conta la dispensa</b>
+      <div class="mut">Le porzioni in casa sono stimate dagli scontrini. Correggile una volta nella sezione Dispensa in fondo: poi bastano gli scontrini e qualche correzione. Mai contati: ${esc(maiContati.join(', '))}.</div>
+      <a class="btn sec" href="#dispensa">Vai alla dispensa</a>
+      <button type="button" class="btn sec" data-act="dispensa-ok">Fatto, non mostrarlo più</button></div>` : ''}
+    ${l.prossimo ? `<div class="card ok"><div class="mut">Prossimo pasto, con quello che hai in casa</div>
+      <div class="big">${esc(l.prossimo.gruppo)}</div><div class="mut">${esc(motivo(l.prossimo))}</div>
+      ${contatore(l.dispensa.find(d => d.id === l.prossimo.id))}
+      <div class="mut">Dopo averlo mangiato, togli le porzioni con −.</div></div>` : ''}
+    <h2>Secondi per i prossimi ${l.pasti} pasti</h2>
+    <div class="card">${l.sequenza.length ? [...perGruppo.values()].map(x => `<div class="riga"><span><b>${esc(x.gruppo)}</b> <span class="mut">× ${x.pasti.length}</span></span>
+      <span class="${x.pasti.every(q => q.inCasa) ? 'ok' : 'warn'}">${x.pasti.every(q => q.inCasa) ? 'in casa' : x.pasti.some(q => q.inCasa) ? 'in parte da comprare' : 'da comprare'}</span></div>`).join('')
+      : 'Nessun pasto da coprire.'}
+      <div class="mut">Ripartizione del piano senza uova (sono a colazione): a ogni pasto il gruppo più indietro, a parità prima quello che hai in casa.</div></div>
+    <h2>Da comprare <span class="mut">${presi}/${nCompra} presi</span></h2>
+    <div class="lista">${compra.length ? compra.join('') : '<div class="card">Niente: quello che hai in casa copre i pasti.</div>'}</div>
     ${presi ? '<button type="button" class="btn sec" data-act="spunte-azzera">Azzera le spunte</button>' : ''}
     ${l.non_comprare.length ? `<h2>Non comprare</h2><div class="card">${l.non_comprare.map(r =>
       `<div class="riga"><span>${esc(r.prodotto)}</span><span class="mut">${r.n} volte in 14 giorni</span></div>`).join('')}</div>` : ''}
-    <details class="card"><summary>Già coperti (${l.ok.length})</summary><div class="lista">${l.ok.map(r => voce(r, false)).join('')}</div></details>
-    <p class="mut">Stima: consumo al ritmo del piano, scadenza per gruppo (freschi 3–7 giorni, surgelati 90, conserve 365). Carboidrati e formaggi sono sommati con le tabelle di conversione (120 g pasta = 160 g pane; 100 g formaggio magro = 50 g fresco = 35 g stagionato).</p>`;
+    <h2 id="dispensa">Dispensa <span class="mut">porzioni in casa</span></h2>
+    <div class="card"><b>Secondi</b>${l.dispensa.filter(d => d.ruolo === 'secondo').map(dispRiga).join('')}</div>
+    <div class="card"><b>Per ogni pasto</b>${l.dispensa.filter(d => d.ruolo !== 'secondo').map(dispRiga).join('')}</div>
+    <p class="mut">Gli scontrini aggiungono le porzioni da soli. I freschi calano al ritmo del piano e a scadenza si considerano mangiati; pasta, legumi, tonno e surgelati restano finché non li correggi. Colazioni, olio e condimenti non sono in lista.</p>`;
 };
 
 VISTE.scansiona = () => {
@@ -441,6 +485,13 @@ VISTE.statistiche = p => {
       ${barra(x.copertura)}
       ${x.n ? `<div class="mut">${x.n} acquisti · ${euro(x.euro)}${x.kcal ? ` · ${Math.round(x.kcal / kcalTot * 100)}% delle kcal` : ''} · ultimo ${dataBreve(x.ultimo)}</div>` : ''}
     </div>`).join('')}</div>
+    ${(() => {
+      const d = L.dispensa(S.db, oggi());
+      return `<h2>Secondi: consumo stimato, ultime 4 settimane</h2><div class="card">${d.secondi.filter(x => x.quota > 0).map(x => `<div class="stat">
+        <div class="riga"><span>${esc(x.gruppo)}</span><span>${n1(Math.round(x.consumati * 10) / 10)} / ${n1(Math.round(x.attesi * 10) / 10)} porzioni</span></div>
+        <div class="mut">${esc(motivo(x))} · quota del piano ${Math.round(x.quota * 100)}%</div></div>`).join('')}
+        <div class="mut">Consumo stimato da scontrini, scadenze e correzioni della dispensa; "attese" = quota del piano × ${n1(Math.round(d.totConsumati * 10) / 10)} secondi consumati in tutto. Uova escluse (sono a colazione).</div></div>`;
+    })()}
     <h2>Con le equivalenze</h2>
     <div class="card">${s.famiglie.map(f => `<div class="stat">
       <div class="riga"><span>${esc(f.nome)} <span class="mut">in g di ${esc(f.rif.toLowerCase())}</span></span><span>${f.parziale ? '≥ ' : ''}${fg(f.comprato)} / ${fg(f.piano)} ${f.pct !== null ? `<b>${Math.round(f.pct)}%</b>` : ''}</span></div>
@@ -473,8 +524,8 @@ VISTE.piano = () => {
   const gruppi = S.db.all("SELECT * FROM gruppi WHERE tipo IN ('piano','extra') AND id NOT IN ('condimenti','bevande') ORDER BY ordine");
   return `<h1>Piano</h1>
     <form class="card" data-submit="piano-salva">
-      <div class="mut">Grammi a settimana per gruppo, dalla lista della spesa del piano alimentare. Vuoto = nessun obiettivo.</div>
-      ${gruppi.map(x => `<label class="riga-input"><span>${esc(x.nome)}${x.porzione_g ? ` <span class="mut">porzione ${fg(x.porzione_g)}</span>` : ''}</span>
+      <div class="mut">Grammi a settimana per gruppo, dalla lista della spesa del piano alimentare. Vuoto = nessun obiettivo. La rotazione dei secondi usa le porzioni a settimana di: ${RUOLI.secondo.map(id => esc(gruppi.find(g => g.id === id)?.nome || id)).join(', ')}.</div>
+      ${gruppi.map(x => `<label class="riga-input"><span>${esc(x.nome)}${x.porzione_g ? ` <span class="mut">porzione ${fg(x.porzione_g)}${RUOLI.secondo.includes(x.id) && x.g_settimana ? ` · ${n1(Math.round(x.g_settimana / x.porzione_g * 10) / 10)} a settimana` : ''}</span>` : ''}</span>
         <input name="g_${esc(x.id)}" inputmode="decimal" value="${x.g_settimana !== null ? n1(x.g_settimana) : ''}" placeholder="g/sett."></label>`).join('')}
       <button type="button" class="btn" data-act="piano-salva">Salva</button>
     </form>`;
@@ -512,13 +563,30 @@ VISTE.dati = async () => {
 // ---------------------------------------------------------------- azioni
 const AZ = {};
 
-AZ.stato = async el => {
-  const { gid, stato: st } = el.dataset;
+const secondiTra = (a, b) => (new Date(b.replace(' ', 'T')) - new Date(a.replace(' ', 'T'))) / 1000;
+
+/** Una conta: le correzioni fatte entro 10 minuti dalla precedente la aggiornano invece di aggiungerne un'altra. */
+async function salvaConta(gid, porzioni) {
+  const ora = adesso();
   await scrivi(() => {
-    if (st === 'auto') S.db.run('DELETE FROM stato_gruppi WHERE gruppo_id=?', [gid]);
-    else S.db.run(`INSERT INTO stato_gruppi (gruppo_id, stato, il) VALUES (?,?,?)
-                   ON CONFLICT(gruppo_id) DO UPDATE SET stato=excluded.stato, il=excluded.il`, [gid, st, adesso()]);
+    const ultima = S.db.one('SELECT il FROM conte WHERE gruppo_id=? ORDER BY il DESC LIMIT 1', [gid]);
+    if (ultima && secondiTra(ultima.il, ora) < 600) S.db.run('UPDATE conte SET porzioni=? WHERE gruppo_id=? AND il=?', [porzioni, gid, ultima.il]);
+    else S.db.run('INSERT INTO conte (gruppo_id, il, porzioni) VALUES (?,?,?)', [gid, ora, porzioni]);
   });
+  render();
+}
+
+AZ.conta = el => {
+  const box = el.closest('.conta');
+  const attuale = num(box.querySelector('input').value) || 0;
+  return salvaConta(box.dataset.gid, Math.max(0, Math.round((attuale + parseInt(el.dataset.delta, 10)) * 2) / 2));
+};
+
+AZ['dispensa-ok'] = async () => { await scrivi(() => S.db.kvSet('dispensa_ok', oggi())); render(); };
+
+AZ.pasti = async el => {
+  const v = Math.max(0, (parseInt(el.closest('.conta').querySelector('input').value, 10) || 0) + parseInt(el.dataset.delta, 10));
+  await scrivi(() => S.db.kvSet('lista_pasti', v));
   render();
 };
 
@@ -748,9 +816,14 @@ AZ['cancella-tutto'] = async () => {
 // ---------------------------------------------------------------- eventi di cambio/input
 const CH = {};
 
-CH['lista-param'] = async el => {
-  const v = Math.max(el.name === 'giorni' ? 1 : 0, parseInt(el.value, 10) || 0);
-  await scrivi(() => S.db.kvSet(el.name === 'giorni' ? 'lista_giorni' : 'lista_fuori', v));
+CH['conta-set'] = el => {
+  const v = num(el.value);
+  if (v === null || v < 0) { toast('Scrivi un numero di porzioni', 'warn'); render(); return; }
+  return salvaConta(el.closest('.conta').dataset.gid, Math.round(v * 2) / 2);
+};
+
+CH['pasti-set'] = async el => {
+  await scrivi(() => S.db.kvSet('lista_pasti', Math.max(0, parseInt(el.value, 10) || 0)));
   render();
 };
 
@@ -871,6 +944,8 @@ IN['cerca-prodotti'] = el => filtra('.lista-link a[data-nome]', el.value);
 
 // ---------------------------------------------------------------- avvio
 document.addEventListener('click', e => {
+  const ancora = e.target.closest('a[href="#dispensa"]');
+  if (ancora) { e.preventDefault(); document.getElementById('dispensa')?.scrollIntoView({ behavior: 'smooth' }); return; }
   const el = e.target.closest('[data-act]');
   if (!el || !AZ[el.dataset.act]) return;
   e.preventDefault();

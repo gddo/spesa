@@ -136,3 +136,18 @@ details .lista .item { border-color: var(--line); background: var(--bg); }
 .toast.warn { background: var(--warn); color: #fff; }
 #aggiorna { position: sticky; top: 0; z-index: 30; width: 100%; padding: 12px; border: 0; background: var(--acc); color: var(--acc-fg); font: inherit; font-weight: 600; }
 #aggiorna[hidden] { display: none; }
+
+/* dispensa: − numero + */
+.conta { display: inline-flex; align-items: stretch; flex: none; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 8px; }
+.conta button { width: 44px; font: inherit; font-size: 22px; line-height: 1; background: var(--soft); color: var(--fg); border: 0; padding: 0; }
+.conta button:active { background: var(--line); }
+.conta input { width: 64px; margin: 0; border: 0; border-radius: 0; text-align: center; font-weight: 650; padding: 9px 4px; background: var(--card); }
+.riga-input .conta { margin: 4px 0; }
+.riga-input:last-child { border-bottom: 0; }
+.disp { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.disp:last-child { border-bottom: 0; }
+.disp .corpo { flex: 1; min-width: 0; }
+.disp .titolo { font-weight: 600; }
+.disp .conta { margin: 0; }
+.card.ok .conta { margin-top: 10px; }
+a.card.warn { display: block; }

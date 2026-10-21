@@ -1,6 +1,6 @@
 // Cose da fare, statistiche e lista "cosa comprare" (porting dell'app Python).
-import { DURATA_PREP, FAMIGLIE } from './db.js';
-import { piuGiorni, diffGiorni } from './date.js';
+import { DURATA_PREP, FAMIGLIE, RUOLI, TRACCIATI, PASTI_PIANO } from './db.js';
+import { piuGiorni, diffGiorni, giorno, daGiorno } from './date.js';
 
 const TIPI_DA_PESARE = "('piano','fuori_piano')";
 
@@ -138,103 +138,150 @@ export function statistiche(db, oggi, giorni = 28) {
     completezza, kcal_tot, kcal_giorno: kcal_tot / giorni_eff };
 }
 
-// ---------------------------------------------------------------- cosa comprare
-/** Simula giorno per giorno: arrivano gli acquisti, scadono i vecchi, si consuma al ritmo del piano
- *  partendo da quello che scade prima. Ritorna [grammi in casa, acquisti senza peso ancora validi]. */
-export function scorta(acquisti, durataGruppo, consumoG, oggi) {
-  if (!acquisti.length) return [0, 0];
-  let magazzino = [], senzaPeso = 0, i = 0;
-  const fine = diffGiorni(oggi, acquisti[0].data);
-  for (let t = 0; t <= fine; t++) {
-    while (i < acquisti.length && diffGiorni(acquisti[i].data, acquisti[0].data) === t) {
-      const a = acquisti[i];
-      const durata = DURATA_PREP[a.preparazione] || durataGruppo || 7;
-      const scade = t + durata;
-      if (a.peso_stimato === null || a.peso_stimato === undefined) { if (scade >= fine) senzaPeso++; }
-      else magazzino.push([scade, a.peso_stimato]);
-      i++;
+// ---------------------------------------------------------------- dispensa e lista
+const STORIA = 120;          // giorni di acquisti e conte usati per ricostruire la dispensa
+const FINESTRA = 28;         // giorni su cui si misura il ritardo rispetto al piano
+const BONUS_IN_CASA = 0.25;  // a ritardo quasi uguale, prima il gruppo che hai già in casa
+const SOGLIA_DISPENSA = 60;  // lotti che durano almeno tanto non calano da soli (pasta, legumi, surgelati)
+
+const arrotonda05 = v => Math.round(v * 2) / 2;
+
+/** Ricostruisce la dispensa di un gruppo giorno per giorno:
+ *  acquisti → lotti; i lotti freschi calano al ritmo del piano e a scadenza si considerano mangiati;
+ *  una conta fissa le porzioni in casa (la differenza diventa consumo, o un lotto in più se ne trovi di più). */
+function simula(g, acquisti, conte, oggi) {
+  const porz = g.porzione_g || 100;
+  const durataGruppo = g.durata_gg || 7;
+  const ritmo = g.g_settimana ? g.g_settimana / 7 : 0;
+  const eventi = [
+    ...acquisti.map(a => ({ ts: `${a.data} ${a.ora || '12:00'}:00`, t: giorno(a.data), tipo: 'acq',
+      g: a.peso_stimato ?? porz, durata: DURATA_PREP[a.preparazione] || durataGruppo })),
+    ...conte.map(c => ({ ts: c.il, t: giorno(c.il), tipo: 'conta', porzioni: c.porzioni })),
+  ].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const fine = giorno(oggi);
+  const consumi = [];
+  let lotti = [], k = 0;
+  const consuma = (grammi, t, soloFreschi) => {
+    let resto = grammi;
+    for (const l of [...lotti].sort((a, b) => a.scade - b.scade)) {
+      if (resto <= 0) break;
+      if (soloFreschi && !l.fresco) continue;
+      const preso = Math.min(l.g, resto);
+      l.g -= preso; resto -= preso;
+      if (preso > 0) consumi.push({ t, g: preso });
     }
-    magazzino = magazzino.filter(m => m[0] >= t).sort((a, b) => a[0] - b[0]);
-    let daMangiare = consumoG;
-    for (const m of magazzino) {
-      const preso = Math.min(m[1], daMangiare);
-      m[1] -= preso; daMangiare -= preso;
-      if (daMangiare <= 0) break;
+    lotti = lotti.filter(l => l.g > 0.5);
+  };
+  const inizio = eventi.length ? Math.min(eventi[0].t, fine) : fine;
+  for (let t = inizio; t <= fine; t++) {
+    for (const l of lotti.filter(x => x.scade < t)) consumi.push({ t: l.scade, g: l.g });
+    lotti = lotti.filter(x => x.scade >= t);
+    for (; k < eventi.length && eventi[k].t === t; k++) {
+      const e = eventi[k];
+      if (e.tipo === 'acq') lotti.push({ g: e.g, scade: t + e.durata, fresco: e.durata < SOGLIA_DISPENSA });
+      else {
+        const totale = lotti.reduce((s, l) => s + l.g, 0), voluto = e.porzioni * porz;
+        if (voluto < totale) consuma(totale - voluto, t, false);
+        else if (voluto > totale) lotti.push({ g: voluto - totale, scade: t + durataGruppo, fresco: durataGruppo < SOGLIA_DISPENSA });
+      }
     }
-    magazzino = magazzino.filter(m => m[1] > 0.5);
+    if (t < fine && ritmo) consuma(ritmo, t, true);   // i giorni già passati
   }
-  return [magazzino.reduce((s, m) => s + m[1], 0), senzaPeso];
+  const ultimo = consumi.length ? Math.max(...consumi.map(c => c.t)) : null;
+  return {
+    stock_g: lotti.reduce((s, l) => s + l.g, 0),
+    consumi,
+    ultimoConsumo: ultimo === null ? null : daGiorno(ultimo),
+    ultimaConta: conte.length ? conte[conte.length - 1].il : null,
+  };
 }
 
-/** Stati "finito"/"presente" ancora validi: decadono quando arriva (importato dopo) un acquisto del gruppo. */
-export function statiAttivi(db) {
-  return Object.fromEntries(db.all(`
-    SELECT st.gruppo_id, st.stato FROM stato_gruppi st
-    WHERE NOT EXISTS (SELECT 1 FROM v_righe v JOIN scontrini s ON s.id = v.scontrino_id
-                      WHERE v.gruppo_id = st.gruppo_id AND s.importato_il > st.il
-                        AND s.data >= date(st.il))`).map(r => [r.gruppo_id, r.stato]));
+/** Dispensa dei gruppi tracciati, con consumo stimato e ritardo dei secondi rispetto al piano. */
+export function dispensa(db, oggi) {
+  const da = piuGiorni(oggi, -STORIA);
+  const finestra = giorno(oggi) - FINESTRA + 1;
+  const gruppi = db.all(`SELECT * FROM gruppi WHERE id IN (${TRACCIATI.map(() => '?').join(',')})`, TRACCIATI);
+  const out = {};
+  for (const g of gruppi) {
+    const acquisti = db.all(`SELECT v.data, s.ora, v.peso_stimato, v.preparazione FROM v_righe v
+        JOIN scontrini s ON s.id = v.scontrino_id WHERE v.gruppo_id = ? AND v.data >= ? AND v.data <= ?`, [g.id, da, oggi]);
+    const conte = db.all('SELECT il, porzioni FROM conte WHERE gruppo_id = ? AND il >= ? ORDER BY il', [g.id, da]);
+    const sim = simula(g, acquisti, conte, oggi);
+    const porz = g.porzione_g || 100;
+    const consumatiG = sim.consumi.filter(c => c.t >= finestra).reduce((s, c) => s + c.g, 0);
+    out[g.id] = {
+      id: g.id, gruppo: g.nome, porzione_g: porz, porzione_nome: g.porzione_nome,
+      ruolo: RUOLI.secondo.includes(g.id) ? 'secondo' : 'per_pasto',
+      g_settimana: g.g_settimana, ordine: g.ordine,
+      stock_g: sim.stock_g, stock_porz: sim.stock_g / porz, mostra: arrotonda05(sim.stock_g / porz),
+      consumati: consumatiG / porz, ultimoConsumo: sim.ultimoConsumo, ultimaConta: sim.ultimaConta,
+    };
+  }
+  // quote del piano: porzioni a settimana di ciascun secondo sul totale dei secondi
+  const sec = RUOLI.secondo.map(id => out[id]).filter(Boolean);
+  sec.forEach(s => { s.porzSett = s.g_settimana && s.porzione_g ? s.g_settimana / s.porzione_g : 0; });
+  const totSett = sec.reduce((t, s) => t + s.porzSett, 0);
+  const totConsumati = sec.filter(s => s.porzSett > 0).reduce((t, s) => t + s.consumati, 0);
+  sec.forEach(s => {
+    s.quota = totSett ? s.porzSett / totSett : 0;
+    s.attesi = s.quota * totConsumati;
+    s.ritardo = s.quota ? s.attesi - s.consumati : 0;
+  });
+  return { gruppi: out, secondi: sec, totConsumati, finestra: FINESTRA };
 }
 
-/** giorni = fino alla prossima spesa; pastiFuori = pranzi/cene fuori in quei giorni. */
-export function cosaComprare(db, oggi, giorni = 4, pastiFuori = 0) {
-  const quotaCasa = giorni ? Math.max(0, 1 - pastiFuori / (2 * giorni)) : 1;
-  const stati = statiAttivi(db);
-  const righe = new Map();
-  for (const g of db.all("SELECT * FROM gruppi WHERE tipo='piano' OR famiglia IS NOT NULL ORDER BY ordine")) {
-    const alGiorno = (g.g_settimana || 0) / 7;
-    const fabbisogno = alGiorno * giorni * (g.pasto === 'principale' ? quotaCasa : 1);
-    const acquisti = db.all(`SELECT data, peso_stimato, preparazione FROM v_righe
-                             WHERE gruppo_id=? AND data >= ? AND data <= ? ORDER BY data`,
-      [g.id, piuGiorni(oggi, -365), oggi]);
-    let [sc, senzaPeso] = scorta(acquisti, g.durata_gg, alGiorno, oggi);
-    const stato = stati[g.id] || null;
-    const note = [];
-    if (stato === 'finito') { sc = 0; note.push('segnato finito'); }
-    else if (stato === 'presente') note.push("segnato: ce n'è");
-    else {
-      if (!acquisti.length) note.push('mai comprato da quando registri');
-      if (senzaPeso) note.push(`${senzaPeso} acquisti recenti senza peso: la scorta può essere più alta`);
-      if ((g.durata_gg || 0) >= 60) note.push("da dispensa: segna finito o ce n'è");
+/** Lista per i prossimi `pasti` pasti principali a casa (pranzi o cene). */
+export function lista(db, oggi, pasti = 4) {
+  const d = dispensa(db, oggi);
+  const P = Math.max(0, Math.round(pasti));
+  // secondi: ogni pasto va al gruppo più indietro rispetto al piano, contando anche i pasti in arrivo
+  const sec = d.secondi.filter(s => s.quota > 0).map(s => ({
+    ...s, domanda: s.ritardo + s.quota * P, disponibili: Math.floor(s.stock_porz + 0.25), assegnati: 0,
+  }));
+  const sequenza = [];
+  for (let n = 0; n < P && sec.length; n++) {
+    let best = null, punteggio = -Infinity;
+    for (const s of sec) {
+      const p = s.domanda + (s.assegnati < s.disponibili ? BONUS_IN_CASA : 0);
+      if (p > punteggio + 1e-9 || (Math.abs(p - punteggio) < 1e-9 && s.quota > best.quota)) { best = s; punteggio = p; }
     }
-    const manca = stato === 'presente' ? 0 : Math.max(0, fabbisogno - sc);
-    const porzioni = g.porzione_g ? manca / g.porzione_g : 0;
-    righe.set(g.id, {
-      id: g.id, gruppo: g.nome, fabbisogno, scorta: sc, manca, stato, famiglia: g.famiglia, fattore: g.fattore,
-      porzioniEsatte: porzioni, porzioni: porzioni ? Math.ceil(porzioni * 2) / 2 : 0,
-      porzione_nome: g.porzione_nome, porzione_g: g.porzione_g, note, piano: !!g.g_settimana,
+    sequenza.push({ id: best.id, gruppo: best.gruppo, inCasa: best.assegnati < best.disponibili });
+    best.assegnati++; best.domanda -= 1;
+  }
+  sec.forEach(s => { s.daComprare = Math.max(0, s.assegnati - s.disponibili); });
+  // con quello che c'è: il gruppo in casa più indietro rispetto al piano
+  const inCasa = sec.filter(s => s.disponibili >= 1).sort((a, b) => (b.ritardo + b.quota) - (a.ritardo + a.quota));
+  const prossimo = inCasa[0] || null;
+
+  // per pasto: piano settimanale / pasti del piano, in porzioni intere
+  const G = d.gruppi;
+  const perPasto = id => (G[id]?.g_settimana || 0) / PASTI_PIANO;
+  const intere = (manca, porz) => (manca > porz * 0.25 ? Math.ceil(manca / porz) : 0);
+  const compraPasto = [];
+  for (const id of ['verdure', 'frutta']) {
+    if (!G[id]) continue;
+    const serve = perPasto(id) * P, manca = Math.max(0, serve - G[id].stock_g), n = intere(manca, G[id].porzione_g);
+    if (n) compraPasto.push({ id, gruppo: G[id].gruppo, porzioni: n, porzione_nome: G[id].porzione_nome, g: n * G[id].porzione_g, serve, stock_g: G[id].stock_g });
+  }
+  if (G.cho_secchi && G.pane) {
+    const f = FAMIGLIE.carboidrati.membri;
+    const serve = (perPasto('cho_secchi') * f.cho_secchi + perPasto('pane') * f.pane) * P;
+    const stock = G.cho_secchi.stock_g * f.cho_secchi + G.pane.stock_g * f.pane;
+    const manca = Math.max(0, serve - stock);
+    const opzioni = ['cho_secchi', 'pane'].map(id => {
+      const n = intere(manca / f[id], G[id].porzione_g);
+      return { id, gruppo: G[id].gruppo, porzioni: n, g: n * G[id].porzione_g };
     });
-  }
-
-  const compra = [], ok = [], fatte = new Set();
-  for (const r of righe.values()) {
-    if (r.famiglia) {
-      if (fatte.has(r.famiglia)) continue;
-      fatte.add(r.famiglia);
-      const f = FAMIGLIE[r.famiglia];
-      const membri = Object.keys(f.membri).filter(m => righe.has(m)).map(m => righe.get(m));
-      // in grammi equivalenti del riferimento: un "ce n'è" copre il fabbisogno del suo gruppo,
-      // le eccedenze di un gruppo compensano le mancanze dell'altro
-      const need = membri.reduce((s, m) => s + m.fabbisogno * m.fattore, 0);
-      const cover = membri.reduce((s, m) => s + (m.stato === 'presente' ? m.fabbisogno : m.scorta) * m.fattore, 0);
-      const mancaRef = Math.max(0, need - cover);
-      const fam = {
-        famiglia: true, id: `fam:${r.famiglia}`, gruppo: f.nome, membri,
-        opzioni: membri.map(m => ({ gruppo: m.gruppo, g: mancaRef / m.fattore, piano: m.fabbisogno > 0 })),
-        fabbisogno: need, scorta: cover, manca: mancaRef,
-        note: membri.filter(m => m.note.length).map(m => `${m.gruppo}: ${m.note.join(', ')}`),
-      };
-      (mancaRef >= 30 ? compra : ok).push(fam);
-      continue;
-    }
-    // soglia sulle porzioni esatte: evita mezze porzioni per pochi grammi
-    (r.porzioniEsatte >= 0.25 ? compra : ok).push(r);
+    if (opzioni.some(o => o.porzioni)) compraPasto.push({ id: 'carboidrati', gruppo: 'Pasta, riso o pane', opzioni, serve, stock_g: stock });
   }
 
   const non_comprare = db.all(`
     SELECT prodotto, COUNT(*) n, MAX(data) ultimo FROM v_righe
     WHERE tipo='fuori_piano' AND data >= ?
     GROUP BY prodotto HAVING n >= 2 ORDER BY n DESC`, [piuGiorni(oggi, -14)]);
-  return { giorni, pastiFuori, compra, ok, non_comprare };
+  const tracciati = TRACCIATI.map(id => G[id]).filter(Boolean);
+  return { pasti: P, sequenza, prossimo, secondi: sec, compraSecondi: sec.filter(s => s.daComprare > 0),
+    compraPasto, dispensa: tracciati, non_comprare, totConsumati: d.totConsumati, finestra: d.finestra };
 }
 
 // ---------------------------------------------------------------- prodotti

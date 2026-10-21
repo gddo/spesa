@@ -42,6 +42,18 @@ export const FAMIGLIE = {
   },
 };
 
+// Ruoli nella lista della spesa.
+// secondo: un secondo per pasto principale a casa, scelto a rotazione secondo le porzioni settimanali del piano.
+//   Le uova restano fuori: l'uovo della colazione copre già la quota del piano.
+// per_pasto: quantità proporzionale ai pasti (piano settimanale / PASTI_PIANO); pasta/riso e pane sono equivalenti.
+// Tutto il resto (colazioni, olio, condimenti, extra) non entra nella lista.
+export const RUOLI = {
+  secondo: ['carne_bianca', 'carne_rossa', 'pesce_magro', 'pesce_scatola', 'legumi', 'formaggio_magro', 'formaggio_stagionato'],
+  per_pasto: ['verdure', 'cho_secchi', 'pane', 'frutta'],
+};
+export const TRACCIATI = [...RUOLI.secondo, ...RUOLI.per_pasto];   // gruppi con la dispensa in porzioni
+export const PASTI_PIANO = 13;   // pranzi e cene del piano escluso il pasto libero (pizza)
+
 export const PREPARAZIONI = ['fresco', 'pronto', 'preparato', 'surgelato', 'conserva'];
 export const DURATA_PREP = { surgelato: 90, conserva: 365 };   // sostituisce la durata del gruppo
 export const PREZZO_INIZIALE = '2000-01-01';                     // "primo prezzo noto"
@@ -86,6 +98,15 @@ CREATE TABLE IF NOT EXISTS prezzi_kg (
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 `;
 
+// v2: dispensa. Ogni conta fissa le porzioni in casa di un gruppo in quel momento;
+// tra una conta e l'altra valgono acquisti, consumo stimato dei freschi e scadenze.
+const SCHEMA_V2 = `
+CREATE TABLE IF NOT EXISTS conte (
+  gruppo_id TEXT NOT NULL REFERENCES gruppi(id), il TEXT NOT NULL, porzioni REAL NOT NULL,
+  PRIMARY KEY (gruppo_id, il)
+);
+`;
+
 // Le righe trovano il prodotto via alias (descrizione stampata), salvo le voci generiche
 // assegnate al singolo acquisto (righe.prodotto_id). Ogni acquisto usa il €/kg in vigore
 // alla sua data; se è precedente al primo prezzo noto, il primo.
@@ -120,7 +141,7 @@ SELECT b.*,
 FROM v_righe_base b;
 `;
 
-export const TABELLE_DATI = ['stato_gruppi', 'pesate', 'prezzi_kg', 'alias', 'righe', 'scontrini', 'prodotti'];
+export const TABELLE_DATI = ['conte', 'stato_gruppi', 'pesate', 'prezzi_kg', 'alias', 'righe', 'scontrini', 'prodotti'];
 
 export class Db {
   constructor(SQL, bytes) {
@@ -168,6 +189,11 @@ export function init(db) {
     db.exec(SCHEMA_V1);
     db.exec('PRAGMA user_version = 1');
   }
+  if (versione < 2) {
+    db.exec(SCHEMA_V2);
+    db.exec('PRAGMA user_version = 2');
+  }
+  db.exec(SCHEMA_V2);   // idempotente: anche dopo un ripristino o un import
   db.exec(VISTE);
   GRUPPI.forEach((g, i) => {
     db.run(`INSERT INTO gruppi (id, nome, tipo, pasto, durata_gg, porzione_g, porzione_nome, ordine)
@@ -180,6 +206,16 @@ export function init(db) {
   for (const [fid, f] of Object.entries(FAMIGLIE))
     for (const [gid, fatt] of Object.entries(f.membri))
       db.run('UPDATE gruppi SET famiglia=?, fattore=? WHERE id=?', [fid, fatt, gid]);
+  convertiStati(db);
+}
+
+/** I vecchi "finito" diventano una conta a 0 nello stesso momento; i "ce n'è" non hanno un numero e si scartano. */
+export function convertiStati(db) {
+  if (!db.val("SELECT COUNT(*) FROM stato_gruppi")) return;
+  db.run(`INSERT OR IGNORE INTO conte (gruppo_id, il, porzioni)
+          SELECT gruppo_id, il, 0 FROM stato_gruppi
+          WHERE stato = 'finito' AND gruppo_id IN (${TRACCIATI.map(() => '?').join(',')})`, TRACCIATI);
+  db.run('DELETE FROM stato_gruppi');
 }
 
 /** Crea o aggiorna il prodotto `nome`; con `descrizione` lo collega alla voce dello scontrino.
