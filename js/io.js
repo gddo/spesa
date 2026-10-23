@@ -1,5 +1,5 @@
 // Import/export: CSV, zip dell'app del Mac, export per l'analisi, backup SQLite.
-import { TABELLE_DATI, PREZZO_INIZIALE, init, convertiStati } from './db.js';
+import { TABELLE_DATI, PREZZO_INIZIALE, init, convertiStati, riempiConte } from './db.js';
 
 const fflate = () => globalThis.fflate;
 
@@ -72,12 +72,13 @@ export function importaZipMac(db, tabelle) {
         const v = parseFloat(p.prezzo_kg);
         if (v > 0) db.run('INSERT OR IGNORE INTO prezzi_kg (prodotto_id, dal, prezzo_kg) VALUES (?,?,?)', [p.id, PREZZO_INIZIALE, v]);
       }
-      // obiettivi del piano
+      // obiettivi del piano e le tue porzioni
       for (const g of tabelle.gruppi || []) {
-        if (!('g_settimana' in g)) continue;
-        db.run('UPDATE gruppi SET g_settimana=? WHERE id=?', [nulli(g.g_settimana), g.id]);
+        if ('g_settimana' in g) db.run('UPDATE gruppi SET g_settimana=? WHERE id=?', [nulli(g.g_settimana), g.id]);
+        if ('mia_g' in g) db.run('UPDATE gruppi SET mia_g=? WHERE id=?', [nulli(g.mia_g), g.id]);
       }
       convertiStati(db);
+      riempiConte(db);
       const rotti = db.all('PRAGMA foreign_key_check');
       if (rotti.length) throw new Error(`dati incoerenti nello zip (${rotti.length} riferimenti rotti, es. ${rotti[0].table})`);
       return conteggi;

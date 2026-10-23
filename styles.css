@@ -152,3 +152,13 @@ details .lista .item { border-color: var(--line); background: var(--bg); }
 .card.ok .conta { margin-top: 10px; }
 a.card.warn { display: block; }
 .card.ok .disp .conta { margin: 0; }
+
+/* statistiche: mangiato e piano */
+.cerchi { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 8px; margin: 12px 0 10px; }
+.cerchio { margin: 0; text-align: center; }
+.cerchio svg { display: block; width: 100%; max-width: 104px; margin: 0 auto 4px; }
+.cerchio figcaption { font-size: 13.5px; line-height: 1.3; }
+.cerchio figcaption .mut { display: block; font-size: 12px; }
+.legenda { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13.5px; color: var(--mut); }
+.legenda span { display: inline-flex; align-items: center; gap: 6px; }
+.legenda svg { width: 14px; height: 14px; }

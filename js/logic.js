@@ -1,5 +1,5 @@
 // Cose da fare, statistiche e lista "cosa comprare" (porting dell'app Python).
-import { DURATA_PREP, FAMIGLIE, RUOLI, TRACCIATI, PASTI_PIANO } from './db.js';
+import { DURATA_PREP, FAMIGLIE, RUOLI, TRACCIATI, PASTI_PIANO, unita } from './db.js';
 import { piuGiorni, diffGiorni, giorno, daGiorno } from './date.js';
 
 const TIPI_DA_PESARE = "('piano','fuori_piano')";
@@ -144,19 +144,17 @@ const FINESTRA = 28;         // giorni su cui si misura il ritardo rispetto al p
 const BONUS_IN_CASA = 0.25;  // a ritardo quasi uguale, prima il gruppo che hai già in casa
 const SOGLIA_DISPENSA = 60;  // lotti che durano almeno tanto non calano da soli (pasta, legumi, surgelati)
 
-const arrotonda05 = v => Math.round(v * 2) / 2;
-
 /** Ricostruisce la dispensa di un gruppo giorno per giorno:
  *  acquisti → lotti; i lotti freschi calano al ritmo del piano e a scadenza si considerano mangiati;
  *  una conta fissa le porzioni in casa (la differenza diventa consumo, o un lotto in più se ne trovi di più). */
 function simula(g, acquisti, conte, oggi) {
-  const porz = g.porzione_g || 100;
+  const porz = unita(g);
   const durataGruppo = g.durata_gg || 7;
   const ritmo = g.g_settimana ? g.g_settimana / 7 : 0;
   const eventi = [
     ...acquisti.map(a => ({ ts: `${a.data} ${a.ora || '12:00'}:00`, t: giorno(a.data), tipo: 'acq',
       g: a.peso_stimato ?? porz, durata: DURATA_PREP[a.preparazione] || durataGruppo })),
-    ...conte.map(c => ({ ts: c.il, t: giorno(c.il), tipo: 'conta', porzioni: c.porzioni })),
+    ...conte.map(c => ({ ts: c.il, t: giorno(c.il), tipo: 'conta', g: c.g ?? c.porzioni * porz })),
   ].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   const fine = giorno(oggi);
   const consumi = [];
@@ -180,7 +178,7 @@ function simula(g, acquisti, conte, oggi) {
       const e = eventi[k];
       if (e.tipo === 'acq') lotti.push({ g: e.g, scade: t + e.durata, fresco: e.durata < SOGLIA_DISPENSA });
       else {
-        const totale = lotti.reduce((s, l) => s + l.g, 0), voluto = e.porzioni * porz;
+        const totale = lotti.reduce((s, l) => s + l.g, 0), voluto = e.g;
         if (voluto < totale) consuma(totale - voluto, t, false);
         else if (voluto > totale) lotti.push({ g: voluto - totale, scade: t + durataGruppo, fresco: durataGruppo < SOGLIA_DISPENSA });
       }
@@ -196,30 +194,62 @@ function simula(g, acquisti, conte, oggi) {
   };
 }
 
-/** Dispensa dei gruppi tracciati, con consumo stimato e ritardo dei secondi rispetto al piano. */
-export function dispensa(db, oggi) {
+/** Consumo stimato (grammi) di ogni gruppo tracciato, giorno per giorno. */
+function simulaTutti(db, oggi) {
   const da = piuGiorni(oggi, -STORIA);
-  const finestra = giorno(oggi) - FINESTRA + 1;
   const gruppi = db.all(`SELECT * FROM gruppi WHERE id IN (${TRACCIATI.map(() => '?').join(',')})`, TRACCIATI);
-  const out = {};
-  for (const g of gruppi) {
+  return gruppi.map(g => {
     const acquisti = db.all(`SELECT v.data, s.ora, v.peso_stimato, v.preparazione FROM v_righe v
         JOIN scontrini s ON s.id = v.scontrino_id WHERE v.gruppo_id = ? AND v.data >= ? AND v.data <= ?`, [g.id, da, oggi]);
-    const conte = db.all('SELECT il, porzioni FROM conte WHERE gruppo_id = ? AND il >= ? ORDER BY il', [g.id, da]);
-    const sim = simula(g, acquisti, conte, oggi);
-    const porz = g.porzione_g || 100;
+    const conte = db.all('SELECT il, porzioni, g FROM conte WHERE gruppo_id = ? AND il >= ? ORDER BY il', [g.id, da]);
+    return { g, sim: simula(g, acquisti, conte, oggi) };
+  });
+}
+
+/** Mangiato (stimato) e piano negli ultimi `giorni` giorni, per i gruppi tracciati; pasta e pane insieme. */
+export function mangiato(db, oggi, giorni = 28) {
+  const prima = db.val('SELECT MIN(data) FROM scontrini');
+  if (!prima) return null;
+  const giorni_eff = Math.min(giorni, diffGiorni(oggi, prima) + 1);
+  const dal = giorno(oggi) - giorni_eff + 1;
+  const voci = {};
+  for (const { g, sim } of simulaTutti(db, oggi)) {
+    voci[g.id] = { id: g.id, nome: g.nome, ordine: g.ordine,
+      g: sim.consumi.filter(c => c.t >= dal).reduce((s, c) => s + c.g, 0),
+      piano: (g.g_settimana || 0) * giorni_eff / 7 };
+  }
+  const f = FAMIGLIE.carboidrati.membri;
+  if (voci.cho_secchi && voci.pane) {
+    const c = voci.cho_secchi, p = voci.pane;
+    voci.cho_secchi = { id: 'carboidrati', nome: 'Pasta, riso o pane', nota: 'eq. pasta', ordine: c.ordine,
+      g: c.g * f.cho_secchi + p.g * f.pane, piano: c.piano * f.cho_secchi + p.piano * f.pane };
+    delete voci.pane;
+  }
+  const out = Object.values(voci).filter(v => v.piano > 0).sort((a, b) => a.ordine - b.ordine);
+  out.forEach(v => { v.pct = v.g / v.piano * 100; });
+  return { giorni, giorni_eff, da: daGiorno(dal), voci: out };
+}
+
+/** Dispensa dei gruppi tracciati, con consumo stimato e ritardo dei secondi rispetto al piano.
+ *  Tutto in porzioni tue (la scatola da 230 g conta 1): così un gruppo con porzioni più grandi
+ *  torna meno spesso e la media settimanale in grammi resta quella del piano. */
+export function dispensa(db, oggi) {
+  const finestra = giorno(oggi) - FINESTRA + 1;
+  const out = {};
+  for (const { g, sim } of simulaTutti(db, oggi)) {
+    const porz = unita(g);
     const consumatiG = sim.consumi.filter(c => c.t >= finestra).reduce((s, c) => s + c.g, 0);
     out[g.id] = {
-      id: g.id, gruppo: g.nome, porzione_g: porz, porzione_nome: g.porzione_nome,
+      id: g.id, gruppo: g.nome, porzione_g: g.porzione_g || 100, unita_g: porz, porzione_nome: g.porzione_nome,
       ruolo: RUOLI.secondo.includes(g.id) ? 'secondo' : 'per_pasto',
       g_settimana: g.g_settimana, ordine: g.ordine,
-      stock_g: sim.stock_g, stock_porz: sim.stock_g / porz, mostra: arrotonda05(sim.stock_g / porz),
+      stock_g: sim.stock_g, stock_porz: sim.stock_g / porz, mostra: Math.round(sim.stock_g / porz),
       consumati: consumatiG / porz, ultimoConsumo: sim.ultimoConsumo, ultimaConta: sim.ultimaConta,
     };
   }
-  // quote del piano: porzioni a settimana di ciascun secondo sul totale dei secondi
+  // quote del piano: porzioni (tue) a settimana di ciascun secondo sul totale dei secondi
   const sec = RUOLI.secondo.map(id => out[id]).filter(Boolean);
-  sec.forEach(s => { s.porzSett = s.g_settimana && s.porzione_g ? s.g_settimana / s.porzione_g : 0; });
+  sec.forEach(s => { s.porzSett = s.g_settimana ? s.g_settimana / s.unita_g : 0; });
   const totSett = sec.reduce((t, s) => t + s.porzSett, 0);
   const totConsumati = sec.filter(s => s.porzSett > 0).reduce((t, s) => t + s.consumati, 0);
   sec.forEach(s => {
@@ -237,7 +267,7 @@ export function lista(db, oggi, pasti = 4) {
   // secondi: ogni pasto va al gruppo più indietro rispetto al piano, contando anche i pasti in arrivo;
   // ogni gruppo al massimo ceil(quota × pasti) volte, così il ritardo accumulato non prende tutti i pasti
   const sec = d.secondi.filter(s => s.quota > 0).map(s => ({
-    ...s, domanda: s.ritardo + s.quota * P, disponibili: Math.floor(s.stock_porz + 0.25), assegnati: 0,
+    ...s, domanda: s.ritardo + s.quota * P, disponibili: s.mostra, assegnati: 0,
     tetto: Math.max(1, Math.ceil(s.quota * P - 1e-9)),
   }));
   const sequenza = [];
@@ -262,8 +292,8 @@ export function lista(db, oggi, pasti = 4) {
   const compraPasto = [];
   for (const id of ['verdure', 'frutta']) {
     if (!G[id]) continue;
-    const serve = perPasto(id) * P, manca = Math.max(0, serve - G[id].stock_g), n = intere(manca, G[id].porzione_g);
-    if (n) compraPasto.push({ id, gruppo: G[id].gruppo, porzioni: n, porzione_nome: G[id].porzione_nome, g: n * G[id].porzione_g, serve, stock_g: G[id].stock_g });
+    const serve = perPasto(id) * P, manca = Math.max(0, serve - G[id].stock_g), n = intere(manca, G[id].unita_g);
+    if (n) compraPasto.push({ id, gruppo: G[id].gruppo, porzioni: n, porzione_nome: G[id].porzione_nome, g: n * G[id].unita_g, serve, stock_g: G[id].stock_g });
   }
   if (G.cho_secchi && G.pane) {
     const f = FAMIGLIE.carboidrati.membri;
@@ -271,8 +301,8 @@ export function lista(db, oggi, pasti = 4) {
     const stock = G.cho_secchi.stock_g * f.cho_secchi + G.pane.stock_g * f.pane;
     const manca = Math.max(0, serve - stock);
     const opzioni = ['cho_secchi', 'pane'].map(id => {
-      const n = intere(manca / f[id], G[id].porzione_g);
-      return { id, gruppo: G[id].gruppo, porzioni: n, g: n * G[id].porzione_g };
+      const n = intere(manca / f[id], G[id].unita_g);
+      return { id, gruppo: G[id].gruppo, porzioni: n, g: n * G[id].unita_g };
     });
     if (opzioni.some(o => o.porzioni)) compraPasto.push({ id: 'carboidrati', gruppo: 'Pasta, riso o pane', opzioni, serve, stock_g: stock });
   }

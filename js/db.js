@@ -194,6 +194,12 @@ export function init(db) {
     db.exec('PRAGMA user_version = 2');
   }
   db.exec(SCHEMA_V2);   // idempotente: anche dopo un ripristino o un import
+  // v3: la tua porzione per gruppo (es. una scatola di legumi da 230 g) e le conte in grammi,
+  // così cambiare porzione non cambia quello che avevi contato
+  aggiungiColonna(db, 'gruppi', 'mia_g', 'REAL');
+  aggiungiColonna(db, 'conte', 'g', 'REAL');
+  riempiConte(db);
+  if (versione < 3) db.exec('PRAGMA user_version = 3');
   db.exec(VISTE);
   GRUPPI.forEach((g, i) => {
     db.run(`INSERT INTO gruppi (id, nome, tipo, pasto, durata_gg, porzione_g, porzione_nome, ordine)
@@ -209,11 +215,23 @@ export function init(db) {
   convertiStati(db);
 }
 
+function aggiungiColonna(db, tabella, colonna, tipo) {
+  if (!db.all(`PRAGMA table_info(${tabella})`).some(c => c.name === colonna)) db.exec(`ALTER TABLE ${tabella} ADD COLUMN ${colonna} ${tipo}`);
+}
+
+/** Conte senza grammi (versioni precedenti, import): porzioni × porzione del piano, l'unica che esisteva. */
+export function riempiConte(db) {
+  db.run('UPDATE conte SET g = porzioni * COALESCE((SELECT porzione_g FROM gruppi WHERE id = conte.gruppo_id), 100) WHERE g IS NULL');
+}
+
+/** Grammi della porzione con cui conti e mangi un gruppo: la tua se l'hai indicata, altrimenti quella del piano. */
+export const unita = g => g.mia_g || g.porzione_g || 100;
+
 /** I vecchi "finito" diventano una conta a 0 nello stesso momento; i "ce n'è" non hanno un numero e si scartano. */
 export function convertiStati(db) {
   if (!db.val("SELECT COUNT(*) FROM stato_gruppi")) return;
-  db.run(`INSERT OR IGNORE INTO conte (gruppo_id, il, porzioni)
-          SELECT gruppo_id, il, 0 FROM stato_gruppi
+  db.run(`INSERT OR IGNORE INTO conte (gruppo_id, il, porzioni, g)
+          SELECT gruppo_id, il, 0, 0 FROM stato_gruppi
           WHERE stato = 'finito' AND gruppo_id IN (${TRACCIATI.map(() => '?').join(',')})`, TRACCIATI);
   db.run('DELETE FROM stato_gruppi');
 }
