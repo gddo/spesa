@@ -151,3 +151,4 @@ details .lista .item { border-color: var(--line); background: var(--bg); }
 .disp .conta { margin: 0; }
 .card.ok .conta { margin-top: 10px; }
 a.card.warn { display: block; }
+.card.ok .disp .conta { margin: 0; }

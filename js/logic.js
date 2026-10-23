@@ -234,14 +234,17 @@ export function dispensa(db, oggi) {
 export function lista(db, oggi, pasti = 4) {
   const d = dispensa(db, oggi);
   const P = Math.max(0, Math.round(pasti));
-  // secondi: ogni pasto va al gruppo più indietro rispetto al piano, contando anche i pasti in arrivo
+  // secondi: ogni pasto va al gruppo più indietro rispetto al piano, contando anche i pasti in arrivo;
+  // ogni gruppo al massimo ceil(quota × pasti) volte, così il ritardo accumulato non prende tutti i pasti
   const sec = d.secondi.filter(s => s.quota > 0).map(s => ({
     ...s, domanda: s.ritardo + s.quota * P, disponibili: Math.floor(s.stock_porz + 0.25), assegnati: 0,
+    tetto: Math.max(1, Math.ceil(s.quota * P - 1e-9)),
   }));
   const sequenza = [];
   for (let n = 0; n < P && sec.length; n++) {
     let best = null, punteggio = -Infinity;
     for (const s of sec) {
+      if (s.assegnati >= s.tetto) continue;   // la somma dei tetti è almeno P: un candidato c'è sempre
       const p = s.domanda + (s.assegnati < s.disponibili ? BONUS_IN_CASA : 0);
       if (p > punteggio + 1e-9 || (Math.abs(p - punteggio) < 1e-9 && s.quota > best.quota)) { best = s; punteggio = p; }
     }
@@ -249,9 +252,8 @@ export function lista(db, oggi, pasti = 4) {
     best.assegnati++; best.domanda -= 1;
   }
   sec.forEach(s => { s.daComprare = Math.max(0, s.assegnati - s.disponibili); });
-  // con quello che c'è: il gruppo in casa più indietro rispetto al piano
-  const inCasa = sec.filter(s => s.disponibili >= 1).sort((a, b) => (b.ritardo + b.quota) - (a.ritardo + a.quota));
-  const prossimo = inCasa[0] || null;
+  // prossimo pasto: i 2 gruppi più indietro sul piano, in casa o no
+  const scelte = [...sec].sort((a, b) => (b.ritardo + b.quota) - (a.ritardo + a.quota) || b.quota - a.quota).slice(0, 2);
 
   // per pasto: piano settimanale / pasti del piano, in porzioni intere
   const G = d.gruppi;
@@ -280,7 +282,7 @@ export function lista(db, oggi, pasti = 4) {
     WHERE tipo='fuori_piano' AND data >= ?
     GROUP BY prodotto HAVING n >= 2 ORDER BY n DESC`, [piuGiorni(oggi, -14)]);
   const tracciati = TRACCIATI.map(id => G[id]).filter(Boolean);
-  return { pasti: P, sequenza, prossimo, secondi: sec, compraSecondi: sec.filter(s => s.daComprare > 0),
+  return { pasti: P, sequenza, scelte, secondi: sec, compraSecondi: sec.filter(s => s.daComprare > 0),
     compraPasto, dispensa: tracciati, non_comprare, totConsumati: d.totConsumati, finestra: d.finestra };
 }
 

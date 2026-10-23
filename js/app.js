@@ -9,7 +9,7 @@ import { parsePdf } from './parser.js';
 import * as scanner from './scanner.js';
 import { oggi, adesso, dataBreve, diffGiorni } from './date.js';
 
-const VERSIONE = '1.1.0';
+const VERSIONE = '1.1.1';
 const S = { SQL: null, db: null, esitiImport: null, ultimaRotta: '' };
 const app = document.getElementById('app');
 const enc = encodeURIComponent;
@@ -194,15 +194,17 @@ VISTE.lista = () => {
       <div class="mut">Le porzioni in casa sono stimate dagli scontrini. Correggile una volta nella sezione Dispensa in fondo: poi bastano gli scontrini e qualche correzione. Mai contati: ${esc(maiContati.join(', '))}.</div>
       <a class="btn sec" href="#dispensa">Vai alla dispensa</a>
       <button type="button" class="btn sec" data-act="dispensa-ok">Fatto, non mostrarlo più</button></div>` : ''}
-    ${l.prossimo ? `<div class="card ok"><div class="mut">Prossimo pasto, con quello che hai in casa</div>
-      <div class="big">${esc(l.prossimo.gruppo)}</div><div class="mut">${esc(motivo(l.prossimo))}</div>
-      ${contatore(l.dispensa.find(d => d.id === l.prossimo.id))}
+    ${l.scelte.length ? `<div class="card ok"><div class="mut">Prossimo pasto: scegli tra</div>
+      ${l.scelte.map(s => `<div class="disp"><div class="corpo"><div class="big">${esc(s.gruppo)}</div>
+        <div class="${s.disponibili >= 1 ? 'ok' : 'warn'}">${s.disponibili >= 1 ? 'in casa' : 'da comprare'}</div>
+        <div class="mut">${esc(motivo(s))}</div></div>
+        ${contatore(l.dispensa.find(d => d.id === s.id))}</div>`).join('')}
       <div class="mut">Dopo averlo mangiato, togli le porzioni con −.</div></div>` : ''}
     <h2>Secondi per i prossimi ${l.pasti} pasti</h2>
     <div class="card">${l.sequenza.length ? [...perGruppo.values()].map(x => `<div class="riga"><span><b>${esc(x.gruppo)}</b> <span class="mut">× ${x.pasti.length}</span></span>
       <span class="${x.pasti.every(q => q.inCasa) ? 'ok' : 'warn'}">${x.pasti.every(q => q.inCasa) ? 'in casa' : x.pasti.some(q => q.inCasa) ? 'in parte da comprare' : 'da comprare'}</span></div>`).join('')
       : 'Nessun pasto da coprire.'}
-      <div class="mut">Ripartizione del piano senza uova (sono a colazione): a ogni pasto il gruppo più indietro, a parità prima quello che hai in casa.</div></div>
+      <div class="mut">Ripartizione del piano senza uova (sono a colazione): a ogni pasto il gruppo più indietro, a parità prima quello che hai in casa; fino a 5 pasti ogni gruppo compare una volta sola.</div></div>
     <h2>Da comprare <span class="mut">${presi}/${nCompra} presi</span></h2>
     <div class="lista">${compra.length ? compra.join('') : '<div class="card">Niente: quello che hai in casa copre i pasti.</div>'}</div>
     ${presi ? '<button type="button" class="btn sec" data-act="spunte-azzera">Azzera le spunte</button>' : ''}
